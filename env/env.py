@@ -1,10 +1,10 @@
-import os
 import time
 import hashlib
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional, Tuple, NamedTuple
-
+import subprocess
+import psutil 
 
 class ActionSpace(NamedTuple):
     shape: tuple
@@ -19,13 +19,13 @@ class FDTDEnv:
     """光学仿真环境"""
     def __init__(
         self,
-        fdtd_path: Path = Path("C:/Program Files/Lumerical/v202/bin/fdtd-solutions.exe"),
-        work_dir: Path = Path("D:/data"),
+        fdtd_path: Path = Path("C:/Program Files/Lumerical/v241/bin/fdtd-solutions.exe"),
+        work_dir: Path = Path("C:/data"),
         fsp_name: str = "jones_model.fsp",
         script_name: str = "script.lsf",
         cache_dir: Path = Path("fdtd_cache"),
         max_steps: int = 500,
-        violation_penalty: float = -0.1,
+        violation_penalty: float = -0.5,
     ):
         # 路径配置
         self.fdtd_path = fdtd_path
@@ -118,31 +118,16 @@ class FDTDEnv:
         # 参数检查（完全基于action_space）
         is_valid, reason = self._check_parameters(action)
         if not is_valid:
-            return (
-                np.zeros(self.observation_space.shape),
-                self.violation_penalty,
-                True,
-                {
-                    "termination_reason": reason,
-                    "violated_params": {
-                        "indices": np.where(
-                            (action < self.action_space.low) | 
-                            (action > self.action_space.high)
-                        )[0].tolist(),
-                        "sum_constraints": {
-                            "p0+p3": float(action[0] + action[3]),
-                            "p6+p7": float(action[6] + action[7]),
-                            "sum_p9p8p5p4p1": float(action[9]+action[8]+action[5]+action[4]+action[1])
-                        }
-                    }
-                }
-            )
+            return self._handle_failure(action, reason)
         
         # 正常仿真流程
         self.current_pra = action
-        obs = self._run_simulation(action)
-        reward = self._calculate_reward(obs)
+        obs, success = self._run_simulation(action)
+
+        if not success:
+            return self._handle_failure(action, "simulation_failed")
         
+        reward = self._calculate_reward(obs)
         done = self.step_count >= self.max_steps
         info = {
             "step": self.step_count,
@@ -152,55 +137,103 @@ class FDTDEnv:
         
         return obs, reward, done, info
 
-    def _run_simulation(self, pra: np.ndarray) -> np.ndarray:
-        """执行仿真并返回观测特征"""
-        # 检查缓存
-        if (cached := self._load_cache(pra)) is not None:
-            return cached
-        
-        # 执行FDTD仿真
-        np.savetxt(self.fdtd_input_path, pra)
-        
-        """
-        '"C:/Program Files/Lumerical/v202/bin/fdtd-solutions.exe" "D:/data/jones_model.fsp" -nw -run "D:/data/script.lsf"'
-        """
-        os.system(
-            f'"{self.fdtd_path}" '
-            f'"{self.fsp_path}" '
-            f'-nw -run "{self.script_path}"'
+    def _handle_failure(self, action: np.ndarray, reason: str) -> Tuple[np.ndarray, float, bool, Dict]:
+        """处理失败情况"""
+        return (
+            np.zeros(self.observation_space.shape),
+            -10.0 if reason == "simulation_failed" else -self.violation_penalty,  
+            True,    # 立即终止
+            {
+                "termination_reason": reason,
+                "pra": self.current_pra.copy()
+            }
         )
+    
+    def _run_simulation(self, pra: np.ndarray, max_retries: int = 2) -> Tuple[np.ndarray, bool]:
+        """执行仿真并处理异常（自动重试机制）
+        
+        Args:
+            pra: 参数数组
+            max_retries: 最大重试次数
+            
+        Returns:
+            tuple: (观测结果数组, 是否成功)
+            
+        Raises:
+            RuntimeError: 超过最大重试次数仍失败
+        """
+        for attempt in range(max_retries + 1):  # 包括首次尝试
+            # 检查缓存（每次重试前都检查）
+            if (cached := self._load_cache(pra)) is not None:
+                return cached
+            
+            # 准备输入文件
+            np.savetxt(self.fdtd_input_path, pra)
+            
+            try:
+                # 启动仿真进程（记录PID以便终止）
+                proc = subprocess.Popen(
+                    [str(self.fdtd_path), str(self.fsp_path), "-nw", "-run", str(self.script_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                
+                # 等待结果（带超时）
+                start_time = time.time()
+                while not self.fdtd_output_path.exists():
+                    if time.time() - start_time > 300:  # 5分钟超时
+                        raise TimeoutError("FDTD simulation timeout")
+                    if proc.poll() is not None and proc.returncode != 0:  # 进程异常退出
+                        raise ValueError(f"FDTD crashed with code {proc.returncode}")
+                    time.sleep(1)
+                
+                # 验证结果
+                raw_data = np.loadtxt(self.fdtd_output_path)
+                if raw_data.shape[1] < 22:
+                    raise ValueError("Invalid simulation output format")
+        
+                # 提取特征
+                obs = np.array([
+                    raw_data[self.target_wavelength_idx, 18],  # eig1_real
+                    raw_data[self.target_wavelength_idx, 19],  # eig1_imag
+                    raw_data[self.target_wavelength_idx, 20],  # eig2_real
+                    raw_data[self.target_wavelength_idx, 21],  # eig2_imag
+                    raw_data[self.target_wavelength_idx, 10],  # r_lr_real
+                    raw_data[self.target_wavelength_idx, 11],  # r_lr_imag
+                    raw_data[self.target_wavelength_idx, 12],  # r_rl_real
+                    raw_data[self.target_wavelength_idx, 13],  # r_rl_imag
+                    raw_data[self.target_wavelength_idx, 14],  # r_rr_real
+                    raw_data[self.target_wavelength_idx, 15],  # r_rr_imag
+                ])
+                
+                    # 保存缓存和原始文件
+                self._save_cache(pra, obs)
+                self._save_raw_file(pra)
+                
+                return obs, True
+            
+            except (TimeoutError, ValueError) as e:
+                # 终止残留进程
+                self._kill_fdtd_processes()
+                
+                # 清理可能生成的不完整文件
+                if self.fdtd_output_path.exists():
+                    self.fdtd_output_path.unlink()
+                
+                if attempt >= max_retries:
+                    return np.zeros(self.observation_space.shape), False
+                
+                time.sleep(1)  # 重试前短暂等待
 
-        # 等待并加载结果
-        start_time = time.time()
-        while not self.fdtd_output_path.exists():
-            if time.time() - start_time > 300:  # 300秒超时
-                raise TimeoutError("FDTD simulation timeout")
-            time.sleep(1)
-        
-        # 添加结果验证
-        raw_data = np.loadtxt(self.fdtd_output_path)
-        if raw_data.shape[1] < 22:  # 检查数据完整性
-            raise ValueError("Invalid simulation output")
-        
-        # 提取特征
-        obs = np.array([
-            raw_data[self.target_wavelength_idx, 18],  # eig1_real
-            raw_data[self.target_wavelength_idx, 19],  # eig1_imag
-            raw_data[self.target_wavelength_idx, 20],  # eig2_real
-            raw_data[self.target_wavelength_idx, 21],  # eig2_imag
-            raw_data[self.target_wavelength_idx, 10],  # r_lr_real
-            raw_data[self.target_wavelength_idx, 11],  # r_lr_imag
-            raw_data[self.target_wavelength_idx, 12],  # r_rl_real
-            raw_data[self.target_wavelength_idx, 13],  # r_rl_imag
-            raw_data[self.target_wavelength_idx, 14],  # r_rr_real
-            raw_data[self.target_wavelength_idx, 15],  # r_rr_imag
-        ])
-        
-            # 保存缓存和原始文件
-        self._save_cache(pra, obs)
-        self._save_raw_file(pra)
-        
-        return obs
+    def _kill_fdtd_processes(self):
+        """终止所有关联的FDTD进程"""
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if proc.info['name'] and 'fdtd' in proc.info['name'].lower():
+                    proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        time.sleep(0.5)  # 等待进程终止
 
     def _calculate_reward(self, obs: np.ndarray) -> float:
         """计算奖励值"""  
