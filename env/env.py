@@ -267,14 +267,10 @@ class FDTDEnv:
 
 if __name__ == "__main__":
     env = FDTDEnv()
-    obs = env.reset()
+    obs, _ = env.reset()
     
-    # 模拟随机策略
+    # 随机策略
     for _ in range(10):
-        action = np.random.uniform(
-            low=env.action_space.low,
-            high=env.action_space.high,
-            size=env.action_space.shape
-        )
+        action = env._generate_valid_parameters()
         obs, reward, done, info = env.step(action)
         print(f"Reward: {reward:.2f} | Obs: {obs}")
