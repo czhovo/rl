@@ -20,6 +20,9 @@ class FDTDEnv:
         self.fsp_path = work_dir / fsp_name
         self.script_path = work_dir / script_name
         self.cache_dir = cache_dir
+        self.obs_cache_dir = cache_dir / "obs"  # 观测结果缓存目录
+        self.raw_cache_dir = cache_dir / "raw"  # 原始数据缓存目录
+        
 
         # 文件
         self.fdtd_input_path = work_dir / "pra.txt"
@@ -27,6 +30,8 @@ class FDTDEnv:
         
         # 创建必要目录
         self.cache_dir.mkdir(exist_ok=True)
+        self.obs_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_cache_dir.mkdir(parents=True, exist_ok=True)
         
         # ?
         self.target_wavelength_idx = 100  # 650nm? 600+100=700?
@@ -154,10 +159,11 @@ class FDTDEnv:
         """
         pra_str = ",".join(map(str, pra))
         hash_name = hashlib.md5(pra_str.encode()).hexdigest()
+        
         if file_type == "obs":
-            return self.cache_dir / f"{hash_name}.npy"
+            return self.obs_cache_dir / f"{hash_name}.npy"
         elif file_type == "raw":
-            return self.cache_dir / f"{hash_name}_raw.txt"
+            return self.raw_cache_dir / f"{hash_name}.txt"
         else:
             raise ValueError(f"Unknown file type: {file_type}")
         
