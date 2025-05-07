@@ -169,6 +169,10 @@ class FDTDEnv:
             
             # 准备输入文件
             np.savetxt(self.fdtd_input_path, pra)
+
+            # 如果输出文件已存在，则删除
+            if self.fdtd_output_path.exists():
+                self.fdtd_output_path.unlink()
             
             try:
                 # 启动仿真进程（记录PID以便终止）
