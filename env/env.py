@@ -87,7 +87,7 @@ class FDTDEnv:
         np.savetxt(self.fdtd_input_path, pra)
         
         """
-        
+        '"C:/Program Files/Lumerical/v202/bin/fdtd-solutions.exe" "D:/data/jones_model.fsp" -nw -run "D:/data/script.lsf"'
         """
         os.system(
             f'"{self.fdtd_path}" '
@@ -115,7 +115,10 @@ class FDTDEnv:
             raw_data[self.target_wavelength_idx, 15],  # r_rr_imag
         ])
         
+            # 保存缓存和原始文件
         self._save_cache(pra, obs)
+        self._save_raw_file(pra)
+        
         return obs
 
     def _calculate_reward(self, obs: np.ndarray) -> float:
@@ -143,20 +146,41 @@ class FDTDEnv:
         else:
             return 1.0 + CD
         
-
-    def _get_cache_path(self, pra: np.ndarray) -> Path:
-        """获取缓存路径"""
+    def _get_cache_path(self, pra: np.ndarray, file_type: str = "obs") -> Path:
+        """获取缓存路径
+        Args:
+            pra: 参数数组
+            file_type: 文件类型，'obs'为观测结果，'raw'为原始文件
+        """
         pra_str = ",".join(map(str, pra))
-        return self.cache_dir / f"{hashlib.md5(pra_str.encode()).hexdigest()}.npy"
-
+        hash_name = hashlib.md5(pra_str.encode()).hexdigest()
+        if file_type == "obs":
+            return self.cache_dir / f"{hash_name}.npy"
+        elif file_type == "raw":
+            return self.cache_dir / f"{hash_name}_raw.txt"
+        else:
+            raise ValueError(f"Unknown file type: {file_type}")
+        
     def _load_cache(self, pra: np.ndarray) -> Optional[np.ndarray]:
-        """加载缓存"""
-        path = self._get_cache_path(pra)
+        """加载缓存观测结果"""
+        path = self._get_cache_path(pra, "obs")
         return np.load(path) if path.exists() else None
 
     def _save_cache(self, pra: np.ndarray, obs: np.ndarray):
-        """保存缓存"""
-        np.save(self._get_cache_path(pra), obs)
+        """保存缓存观测结果"""
+        np.save(self._get_cache_path(pra, "obs"), obs)
+
+    def _save_raw_file(self, pra: np.ndarray):
+        """保存原始仿真文件"""
+        raw_path = self._get_cache_path(pra, "raw")
+        if self.fdtd_output_path.exists():
+            import shutil
+            shutil.copy(self.fdtd_output_path, raw_path)
+
+    def _load_raw_file(self, pra: np.ndarray) -> Optional[Path]:
+        """获取缓存的原始文件路径"""
+        raw_path = self._get_cache_path(pra, "raw")
+        return raw_path if raw_path.exists() else None
 
 # 使用示例（与PPO兼容）
 if __name__ == "__main__":
