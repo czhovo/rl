@@ -3,7 +3,17 @@ import time
 import hashlib
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, NamedTuple
+
+
+class ActionSpace(NamedTuple):
+    shape: tuple
+    low: np.ndarray
+    high: np.ndarray
+    validate: callable
+
+class ObservationSpace(NamedTuple):
+    shape: tuple
 
 class FDTDEnv:
     """光学仿真环境"""
@@ -13,7 +23,9 @@ class FDTDEnv:
         work_dir: Path = Path("D:/data"),
         fsp_name: str = "jones_model.fsp",
         script_name: str = "script.lsf",
-        cache_dir: Path = Path("fdtd_cache")
+        cache_dir: Path = Path("fdtd_cache"),
+        max_steps: int = 500,
+        violation_penalty: float = -0.1,
     ):
         # 路径配置
         self.fdtd_path = fdtd_path
@@ -34,51 +46,109 @@ class FDTDEnv:
         self.raw_cache_dir.mkdir(parents=True, exist_ok=True)
         
         # ?
-        self.target_wavelength_idx = 100  # 650nm? 600+100=700?
+        self.target_wavelength_idx = 150  # 750nm(600+150)
         
         # 定义动作/观测空间
         self.action_space = self._build_action_space()
         self.observation_space = self._build_observation_space()
         
+        # 终止条件和越界惩罚
+        self.max_steps = max_steps
+        self.violation_penalty = violation_penalty
+
         # 状态初始化
         self.current_pra = None
+        self.step_count = 0
 
-    def _build_action_space(self):
-        """定义动作空间（连续参数）"""
-        from collections import namedtuple
-        Space = namedtuple('Space', ['shape', 'low', 'high'])
-        return Space(
-            shape=(10,),  # 假设pra有10个参数
-            low=np.array([10]*10),  # 参数最小值
-            high=np.array([200]*10) # 参数最大值
-        )
-
-    def _build_observation_space(self):
-        """定义观测空间（仿真结果特征）"""
-        from collections import namedtuple
-        Space = namedtuple('Space', ['shape'])
-        return Space(shape=(10,))  # eig1, eig2, r_lr, r_rl, r_rr
-
-    def reset(self) -> np.ndarray:
-        """重置环境，返回初始观测"""
-        self.current_pra = np.array([20, 30, 40, 50, 60, 70, 80, 90, 100, 110])  # 示例初始参数
-        return self._run_simulation(self.current_pra)
-
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, dict]:
-        """
-        执行动作
-        返回: (observation, reward, done, info)
-        """
-        self.current_pra = np.clip(
-            action,
-            self.action_space.low,
-            self.action_space.high
-        )
+    def _build_action_space(self) -> ActionSpace:
+        """构建带组合约束的动作空间"""
+        low = np.array([30, 40, 40, 80, 40, 40, 30, 40, 40, 30], dtype=np.float32)
+        high = np.array([160, 100, 80, 340, 100, 100, 150, 340, 100, 100], dtype=np.float32)
         
-        obs = self._run_simulation(self.current_pra)
+        def validate(pra: np.ndarray) -> bool:
+            # 检查基础范围
+            if not np.all((low <= pra) & (pra <= high)):
+                return False
+            # 检查组合约束
+            return (pra[0] + pra[3] <= 370 and 
+                    pra[6] + pra[7] <= 340 and
+                    pra[9] + pra[8] + pra[5] + pra[4] + pra[1] <= 370)
+        
+        return ActionSpace(
+            shape=(10,),
+            low=low,
+            high=high,
+            validate=validate
+        )
+
+    def _build_observation_space(self) -> ObservationSpace:
+        """定义观测空间"""
+        return ObservationSpace(shape=(10,))  # 保持原有10维特征
+    
+    def _check_parameters(self, pra: np.ndarray) -> Tuple[bool, str]:
+        """检查参数合法性（返回状态和失败原因）"""
+        if not np.all((self.action_space.low <= pra) & (pra <= self.action_space.high)):
+            return False, "individual_bound_violation"
+        if not self.action_space.validate(pra):
+            return False, "combined_bound_violation"
+        return True, ""
+
+    def reset(self) -> Tuple[np.ndarray, Dict]:
+        """生成符合边界条件的随机参数作为初始状态"""
+        self.step_count = 0
+        self.current_pra = self._generate_valid_parameters()
+        return self._run_simulation(self.current_pra), {"init_params": self.current_pra.copy()}
+
+    def _generate_valid_parameters(self, max_attempts: int = 10) -> np.ndarray:
+        """生成满足所有约束的随机参数"""
+        for _ in range(max_attempts):
+            pra = np.random.uniform(
+                low=self.action_space.low,
+                high=self.action_space.high
+            )
+            
+            if self.action_space.validate(pra):
+                return pra
+            
+        return np.array([30, 40, 40, 80, 40, 40, 30, 40, 40, 30])
+    
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
+        self.step_count += 1
+        
+        # 参数检查（完全基于action_space）
+        is_valid, reason = self._check_parameters(action)
+        if not is_valid:
+            return (
+                np.zeros(self.observation_space.shape),
+                self.violation_penalty,
+                True,
+                {
+                    "termination_reason": reason,
+                    "violated_params": {
+                        "indices": np.where(
+                            (action < self.action_space.low) | 
+                            (action > self.action_space.high)
+                        )[0].tolist(),
+                        "sum_constraints": {
+                            "p0+p3": float(action[0] + action[3]),
+                            "p6+p7": float(action[6] + action[7]),
+                            "sum_p9p8p5p4p1": float(action[9]+action[8]+action[5]+action[4]+action[1])
+                        }
+                    }
+                }
+            )
+        
+        # 正常仿真流程
+        self.current_pra = action
+        obs = self._run_simulation(action)
         reward = self._calculate_reward(obs)
-        done = False  # 持续优化任务无需自动终止
-        info = {"pra": self.current_pra.copy()}
+        
+        done = self.step_count >= self.max_steps
+        info = {
+            "step": self.step_count,
+            "termination_reason": "max_steps_reached" if done else None,
+            "pra": self.current_pra.copy()
+        }
         
         return obs, reward, done, info
 
@@ -100,11 +170,17 @@ class FDTDEnv:
             f'-nw -run "{self.script_path}"'
         )
 
-
         # 等待并加载结果
+        start_time = time.time()
         while not self.fdtd_output_path.exists():
+            if time.time() - start_time > 300:  # 300秒超时
+                raise TimeoutError("FDTD simulation timeout")
             time.sleep(1)
+        
+        # 添加结果验证
         raw_data = np.loadtxt(self.fdtd_output_path)
+        if raw_data.shape[1] < 22:  # 检查数据完整性
+            raise ValueError("Invalid simulation output")
         
         # 提取特征
         obs = np.array([
@@ -188,7 +264,7 @@ class FDTDEnv:
         raw_path = self._get_cache_path(pra, "raw")
         return raw_path if raw_path.exists() else None
 
-# 使用示例（与PPO兼容）
+
 if __name__ == "__main__":
     env = FDTDEnv()
     obs = env.reset()
