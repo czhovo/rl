@@ -85,7 +85,7 @@ class FDTDEnv:
         """定义观测空间"""
         return ObservationSpace(shape=(10,))  # 保持原有10维特征
     
-    def xmax_check_parameters(self, pra: np.ndarray) -> Tuple[bool, str]:
+    def _check_parameters(self, pra: np.ndarray) -> Tuple[bool, str]:
         """检查参数合法性（返回状态和失败原因）"""
         if not np.all((self.action_space.low <= pra) & (pra <= self.action_space.high)):
             return False, "individual_bound_violation"
@@ -129,7 +129,7 @@ class FDTDEnv:
         
         reward = self._calculate_reward(obs)
 
-        print('reward', reward)
+        print(f'[{time.time()-_program_start_time:.2f}]', 'reward', reward)
 
         done = self.step_count >= self.max_steps
         info = {
@@ -165,7 +165,7 @@ class FDTDEnv:
         Raises:
             RuntimeError: 超过最大重试次数仍失败
         """
-        print('simulation started')
+        print(f'[{time.time()-_program_start_time:.2f}]', 'simulation started, pras:', pra)
 
 
         for attempt in range(max_retries + 1):  # 包括首次尝试
@@ -202,7 +202,7 @@ class FDTDEnv:
                 if raw_data.shape[1] < 22:
                     raise ValueError("Invalid simulation output format")
         
-                print('simulation finished')
+                print(f'[{time.time()-_program_start_time:.2f}]', 'simulation finished')
 
                 # 提取特征
                 obs = np.array([
@@ -222,7 +222,7 @@ class FDTDEnv:
                 self._save_cache(pra, obs)
                 self._save_raw_file(pra)
 
-                print('result cached')
+                print(f'[{time.time()-_program_start_time:.2f}]', 'result cached')
                 
                 return obs, True
             
@@ -244,7 +244,7 @@ class FDTDEnv:
         for proc in psutil.process_iter(['pid', 'name']):
             try:
                 if proc.info['name'] and 'fdtd' in proc.info['name'].lower():
-                    print('kill', proc)
+                    print(f'[{time.time()-_program_start_time:.2f}]', 'kill', proc)
                     proc.terminate()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -254,7 +254,7 @@ class FDTDEnv:
         """计算奖励值"""  
         assert len(obs) == 10, f"Expected 10 features, got {len(obs)}"
 
-        print('start _calculate_reward')
+        print(f'[{time.time()-_program_start_time:.2f}]', 'start _calculate_reward')
 
         eig1_real, eig1_imag, eig2_real, eig2_imag, r_lr_real, r_lr_imag, \
             r_rl_real, r_rl_imag, r_rr_real, r_rr_imag = obs
@@ -317,13 +317,15 @@ class FDTDEnv:
 
 
 if __name__ == "__main__":
+
+    _program_start_time = time.time()
+
     env = FDTDEnv()
     obs, _ = env.reset()
     
     # 随机策略
     for _ in range(10):
-        print('start loop', _)
+        print(f'[{time.time()-_program_start_time:.2f}]', 'start loop', _)
         action = env._generate_valid_parameters()
-        print('Pras:', action)
         obs, reward, done, info = env.step(action)
-        print(f"Reward: {reward:.2f} | Obs: {obs}")
+        print(f'[{time.time()-_program_start_time:.2f}]', f"Reward: {reward:.2f} | Obs: {obs}")
