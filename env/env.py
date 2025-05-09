@@ -1,12 +1,9 @@
 import time
-import hashlib
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional, Tuple, NamedTuple
 import subprocess
 import psutil 
-
-# 43 35
 
 class ActionSpace(NamedTuple):
     shape: tuple
@@ -23,34 +20,39 @@ class FDTDEnv:
         self,
         fdtd_path: Path = Path("C:/Program Files/Lumerical/v241/bin/fdtd-solutions.exe"),
         work_dir: Path = Path("C:/data"),
-        fsp_name: str = "jones_model.fsp",
-        script_name: str = "script.lsf",
+        fast_fsp_name: str = "jones_model.fsp",
+        fast_script_name: str = "script.lsf",
         cache_dir: Path = Path("fdtd_cache"),
-        max_steps: int = 500,
+        max_steps: int = 50,
         violation_penalty: float = -1,
-        target_wavelength_idx: int = 43 # 43/35/150
+        target_wavelength_idx: int = 43, # 43/35/150
+        CD_threshold: float = 0.2,      
+        eig_diff_threshold: float = 0.02
     ):
         # 路径配置
         self.fdtd_path = fdtd_path
-        self.fsp_path = work_dir / fsp_name
-        self.script_path = work_dir / script_name
+        self.fast_fsp_path = work_dir / fast_fsp_name
+        self.fast_script_path = work_dir / fast_script_name
         self.cache_dir = cache_dir
-        self.obs_cache_dir = cache_dir / "obs"  # 观测结果缓存目录
-        self.raw_cache_dir = cache_dir / "raw"  # 原始数据缓存目录
+        self.cache_file = self.cache_dir / "reward_cache.npz"
         
-
         # 文件
         self.fdtd_input_path = work_dir / "pra.txt"
         self.fdtd_output_path = work_dir / "farfile_reflection.txt"
         
         # 创建必要目录
         self.cache_dir.mkdir(exist_ok=True)
-        self.obs_cache_dir.mkdir(parents=True, exist_ok=True)
-        self.raw_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # 初始化缓存
+        self.reward_cache = {}  # 使用字典存储{pra_tuple: reward}
+        self._load_cache()
         
         # 目标波长
         self.target_wavelength_idx = target_wavelength_idx
-
+        
+        self.CD_threshold = CD_threshold
+        self.eig_diff_threshold = eig_diff_threshold
+        
         # 参数约束定义
         self.param_bounds = self._build_param_bounds()
         
@@ -70,11 +72,11 @@ class FDTDEnv:
         # 状态初始化
         self.current_pra = None
         self.step_count = 0
-
+    
     def _build_param_bounds(self) -> ActionSpace:
         """定义参数约束"""
-        low = np.array([30, 40, 40, 80, 40, 40, 30, 40, 40, 30], dtype=np.float32)
-        high = np.array([160, 100, 80, 340, 100, 100, 150, 340, 100, 100], dtype=np.float32)
+        low = np.array([30, 40, 40, 80, 40, 40, 30, 40, 40, 30], dtype=np.int32)
+        high = np.array([160, 100, 80, 340, 100, 100, 150, 340, 100, 100], dtype=np.int32)
         
         def validate(pra: np.ndarray) -> bool:
             if not np.all((low <= pra) & (pra <= high)):
@@ -93,7 +95,7 @@ class FDTDEnv:
     def _action_to_pra(self, action: np.ndarray) -> np.ndarray:
         """将归一化动作转换为仿真参数"""
         pra = action * (self.param_bounds.high - self.param_bounds.low) + self.param_bounds.low
-        pra = np.round(pra / 4) * 4  # 量化到4的倍数
+        pra = np.round(pra / 4).astype(np.int32) * 4
         return np.clip(pra, self.param_bounds.low, self.param_bounds.high)
 
     def _check_parameters(self, pra: np.ndarray) -> Tuple[bool, str]:
@@ -135,19 +137,31 @@ class FDTDEnv:
         if not is_valid:
             return self._handle_failure(action, reason)
         
-        # 正常仿真流程
-        obs, success = self._run_simulation(pra)
+        # 检查缓存
+        if (reward := self._get_cached_reward(pra)) is not None:
+            print(f'[{time.time()-_program_start_time:.2f}]', 'cache hit, pras:', pra)
+            return state, reward, False, {
+                "step": self.step_count,
+                "pra": pra,
+                "cached": True
+            }
+
+        # 快速仿真
+        obs, success = self._run_fast_simulation(pra)
 
         if not success:
             return self._handle_failure(action, "simulation_failed")
         
+        # 计算并缓存奖励
         reward = self._calculate_reward(obs)
+        self._cache_reward(pra, reward)
 
         done = self.step_count >= self.max_steps
         info = {
             "step": self.step_count,
             "termination_reason": "max_steps_reached" if done else None,
-            "pra": pra
+            "pra": pra,
+            "cached": False
         }
         
         return state, reward, done, info
@@ -164,7 +178,7 @@ class FDTDEnv:
             }
         )
     
-    def _run_simulation(self, pra: np.ndarray, max_retries: int = 2) -> Tuple[np.ndarray, bool]:
+    def _run_fast_simulation(self, pra: np.ndarray, max_retries: int = 2) -> Tuple[np.ndarray, bool]:
         """执行仿真并处理异常（自动重试机制）
         
         Args:
@@ -180,12 +194,8 @@ class FDTDEnv:
         print(f'[{time.time()-_program_start_time:.2f}]', 'simulation started, pras:', pra)
 
 
-        for attempt in range(max_retries + 1):  # 包括首次尝试
-            # 检查缓存（每次重试前都检查）
-            if (cached := self._load_cache(pra)) is not None:
-                return cached
+        for attempt in range(max_retries + 1):
             
-            # 准备输入文件
             np.savetxt(self.fdtd_input_path, pra)
 
             # 如果输出文件已存在，则删除
@@ -195,7 +205,7 @@ class FDTDEnv:
             try:
                 # 启动仿真进程（记录PID以便终止）
                 proc = subprocess.Popen(
-                    [str(self.fdtd_path), str(self.fsp_path), "-nw", "-run", str(self.script_path)],
+                    [str(self.fdtd_path), str(self.fast_fsp_path), "-nw", "-run", str(self.fast_script_path)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE
                 )
@@ -215,26 +225,16 @@ class FDTDEnv:
                     raise ValueError("Invalid simulation output format")
         
                 print(f'[{time.time()-_program_start_time:.2f}]', 'simulation finished')
-
-                # 提取特征
-                obs = np.array([
-                    raw_data[self.target_wavelength_idx, 18],  # eig1_real
-                    raw_data[self.target_wavelength_idx, 19],  # eig1_imag
-                    raw_data[self.target_wavelength_idx, 20],  # eig2_real
-                    raw_data[self.target_wavelength_idx, 21],  # eig2_imag
-                    raw_data[self.target_wavelength_idx, 10],  # r_lr_real
-                    raw_data[self.target_wavelength_idx, 11],  # r_lr_imag
-                    raw_data[self.target_wavelength_idx, 12],  # r_rl_real
-                    raw_data[self.target_wavelength_idx, 13],  # r_rl_imag
-                    raw_data[self.target_wavelength_idx, 14],  # r_rr_real
-                    raw_data[self.target_wavelength_idx, 15],  # r_rr_imag
-                ])
                 
-                    # 保存缓存和原始文件
-                self._save_cache(pra, obs)
-                self._save_raw_file(pra)
-
-                print(f'[{time.time()-_program_start_time:.2f}]', 'result cached')
+                target_data = raw_data[self.target_wavelength_idx]
+                
+                obs = np.array([
+                    target_data[18], target_data[19],  # eig1
+                    target_data[20], target_data[21],  # eig2
+                    target_data[10], target_data[11],  # r_lr
+                    target_data[12], target_data[13],  # r_rl 
+                    target_data[14], target_data[15]   # r_rr
+                ])
                 
                 return obs, True
             
@@ -249,7 +249,7 @@ class FDTDEnv:
                 if attempt >= max_retries:
                     return np.zeros(self.observation_space.shape), False
                 
-                time.sleep(1)  # 重试前短暂等待
+                time.sleep(1)
 
     def _kill_fdtd_processes(self):
         """终止所有关联的FDTD进程"""
@@ -279,51 +279,58 @@ class FDTDEnv:
         denominator = max(r_lr_sq + r_rl_sq + 2*r_rr_sq, 1e-10)
         CD = np.abs(r_lr_sq - r_rl_sq) / denominator
 
-        # 根据条件返回不同结果
+        
+        if CD < self.CD_threshold:
+            return CD - 1
+        else:
+            if eig_diff < self.eig_diff_threshold:
+                return 1 + CD
+            else:
+                eig_abs = (np.abs(eig1_real) + np.abs(eig1_imag) + np.abs(eig2_real) + np.abs(eig2_imag)) / 4
+                return 1 - eig_diff - eig_abs * 0.25
+        
+
+        """# 根据条件返回不同结果
         if eig_diff > 0.5 or CD < 0.2:
             return CD
         elif eig_diff > 0.02:
             return 0.5 - eig_diff + 0.6 * CD
         else:
-            return 1.0 + CD
+            return 1.0 + CD"""
         
-    def _get_cache_path(self, pra: np.ndarray, file_type: str = "obs") -> Path:
-        """获取缓存路径
-        Args:
-            pra: 参数数组
-            file_type: 文件类型，'obs'为观测结果，'raw'为原始文件
-        """
-        pra_str = ",".join(map(str, pra))
-        hash_name = hashlib.md5(pra_str.encode()).hexdigest()
-        
-        if file_type == "obs":
-            return self.obs_cache_dir / f"{hash_name}.npy"
-        elif file_type == "raw":
-            return self.raw_cache_dir / f"{hash_name}.txt"
-        else:
-            raise ValueError(f"Unknown file type: {file_type}")
-        
-    def _load_cache(self, pra: np.ndarray) -> Optional[np.ndarray]:
-        """加载缓存观测结果"""
-        path = self._get_cache_path(pra, "obs")
-        return np.load(path) if path.exists() else None
+    def _pra_to_key(self, pra: np.ndarray) -> tuple:
+        """将int32的pra转为不可变的元组键"""
+        return tuple(pra.tolist())
+    
+    def _load_cache(self):
+        """加载缓存"""
+        if self.cache_file.exists():
+            try:
+                data = np.load(self.cache_file, allow_pickle=True)
+                self.reward_cache = {
+                    tuple(map(int, k)): float(v) 
+                    for k, v in zip(data['keys'], data['values'])
+                    if len(k) == 10 
+                }
+                print(f'[{time.time()-_program_start_time:.2f}]', 'cache loaded')
 
-    def _save_cache(self, pra: np.ndarray, obs: np.ndarray):
-        """保存缓存观测结果"""
-        np.save(self._get_cache_path(pra, "obs"), obs)
+            except Exception as e:
+                print(f"缓存加载失败: {e}")
 
-    def _save_raw_file(self, pra: np.ndarray):
-        """保存原始仿真文件"""
-        raw_path = self._get_cache_path(pra, "raw")
-        if self.fdtd_output_path.exists():
-            import shutil
-            shutil.copy(self.fdtd_output_path, raw_path)
+    def _save_cache(self):
+        """保存缓存到文件"""
+        if self.reward_cache:
+            keys, values = zip(*self.reward_cache.items())
+            np.savez(self.cache_file, keys=np.array(keys), values=np.array(values))
 
-    def _load_raw_file(self, pra: np.ndarray) -> Optional[Path]:
-        """获取缓存的原始文件路径"""
-        raw_path = self._get_cache_path(pra, "raw")
-        # ?
-        return raw_path if raw_path.exists() else None
+    def _get_cached_reward(self, pra: np.ndarray) -> Optional[float]:
+        """查询缓存"""
+        return self.reward_cache.get(self._pra_to_key(pra), None)
+
+    def _cache_reward(self, pra: np.ndarray, reward: float):
+        """缓存新记录"""
+        self.reward_cache[self._pra_to_key(pra)] = reward
+        self._save_cache()
 
 
 if __name__ == "__main__":
