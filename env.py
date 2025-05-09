@@ -23,12 +23,15 @@ class FDTDEnv:
         fast_fsp_name: str = "jones_model.fsp",
         fast_script_name: str = "script.lsf",
         cache_dir: Path = Path("fdtd_cache"),
-        max_steps: int = 50,
+        max_steps: int = 64,
         violation_penalty: float = -1,
         target_wavelength_idx: int = 43, # 43/35/150
         CD_threshold: float = 0.2,      
         eig_diff_threshold: float = 0.02
     ):
+        
+        # 时间
+        self._start_time = time.time()
         # 路径配置
         self.fdtd_path = fdtd_path
         self.fast_fsp_path = work_dir / fast_fsp_name
@@ -139,7 +142,7 @@ class FDTDEnv:
         
         # 检查缓存
         if (reward := self._get_cached_reward(pra)) is not None:
-            print(f'[{time.time()-_program_start_time:.2f}]', 'cache hit, pras:', pra)
+            print(f'[{time.time()-self._start_time:.2f}]', 'cache hit, pras:', pra)
             return state, reward, False, {
                 "step": self.step_count,
                 "pra": pra,
@@ -191,7 +194,7 @@ class FDTDEnv:
         Raises:
             RuntimeError: 超过最大重试次数仍失败
         """
-        print(f'[{time.time()-_program_start_time:.2f}]', 'simulation started, pras:', pra)
+        print(f'[{time.time()-self._start_time:.2f}]', 'simulation started, pras:', pra)
 
 
         for attempt in range(max_retries + 1):
@@ -213,7 +216,7 @@ class FDTDEnv:
                 # 等待结果（带超时）
                 start_time = time.time()
                 while not self.fdtd_output_path.exists():
-                    if time.time() - start_time > 300:  # 5分钟超时
+                    if time.time() - start_time > 480:  # 6分钟超时
                         raise TimeoutError("FDTD simulation timeout")
                     if proc.poll() is not None and proc.returncode != 0:  # 进程异常退出
                         raise ValueError(f"FDTD crashed with code {proc.returncode}")
@@ -224,7 +227,7 @@ class FDTDEnv:
                 if raw_data.shape[1] < 22:
                     raise ValueError("Invalid simulation output format")
         
-                print(f'[{time.time()-_program_start_time:.2f}]', 'simulation finished')
+                print(f'[{time.time()-self._start_time:.2f}]', 'simulation finished')
                 
                 target_data = raw_data[self.target_wavelength_idx]
                 
@@ -256,7 +259,7 @@ class FDTDEnv:
         for proc in psutil.process_iter(['pid', 'name']):
             try:
                 if proc.info['name'] and 'fdtd' in proc.info['name'].lower():
-                    print(f'[{time.time()-_program_start_time:.2f}]', 'kill', proc)
+                    print(f'[{time.time()-self._start_time:.2f}]', 'kill', proc)
                     proc.terminate()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -281,7 +284,7 @@ class FDTDEnv:
 
         
         if CD < self.CD_threshold:
-            return CD - 1
+            return CD
         else:
             if eig_diff < self.eig_diff_threshold:
                 return 1 + CD
@@ -312,7 +315,7 @@ class FDTDEnv:
                     for k, v in zip(data['keys'], data['values'])
                     if len(k) == 10 
                 }
-                print(f'[{time.time()-_program_start_time:.2f}]', 'cache loaded')
+                print(f'[{time.time()-self._start_time:.2f}]', 'cache loaded')
 
             except Exception as e:
                 print(f"缓存加载失败: {e}")
@@ -335,15 +338,13 @@ class FDTDEnv:
 
 if __name__ == "__main__":
 
-    _program_start_time = time.time()
-
     env = FDTDEnv()
     state = env.reset()
-    print(f'[{time.time()-_program_start_time:.2f}]', 'init state:', state)
+    print(f'[{time.time()-env._start_time:.2f}]', 'init state:', state)
     
     # 随机策略
     for _ in range(10):
-        print(f'[{time.time()-_program_start_time:.2f}]', 'start loop', _)
+        print(f'[{time.time()-env._start_time:.2f}]', 'start loop', _)
         action = env._generate_valid_action()
         state, reward, done, info = env.step(action)
-        print(f'[{time.time()-_program_start_time:.2f}]', state, reward, done, info)
+        print(f'[{time.time()-env._start_time:.2f}]', state, reward, done, info)

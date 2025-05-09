@@ -2,12 +2,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import numpy as np
 from torch.distributions import Normal
-from typing import Tuple, Dict
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
+import time
+
+from env import FDTDEnv
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 64):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
         # 共享特征提取层
         self.shared = nn.Sequential(
@@ -23,23 +26,15 @@ class ActorCritic(nn.Module):
         self.critic = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        shared_out = self.shared(x)
-        mean = self.actor_mean(shared_out)
+        hidden = self.shared(x)
+        mean = torch.sigmoid(self.actor_mean(hidden))
         logstd = self.actor_logstd.expand_as(mean)
-        return mean, logstd, self.critic(shared_out)
+        value = self.critic(hidden)
+        return mean, logstd, value
     
-    def act(self, state: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        """选择动作（连续空间），返回动作、log概率和状态价值"""
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(state)
-            mean, logstd, value = self.forward(state_tensor)
-            dist = Normal(mean, logstd.exp())
-            action = dist.sample()
-            log_prob = dist.log_prob(action).sum(-1)
-        return action.numpy(), log_prob.item(), value.item()
-
 class PPOBuffer:
-    def __init__(self, buffer_size: int, state_dim: int, action_dim: int, gamma: float = 0.99, gae_lambda: float = 0.95):
+    def __init__(self, buffer_size, state_dim, action_dim, gamma=0.99, gae_lambda=0.95):
+        self.buffer_size = buffer_size
         self.states = np.zeros((buffer_size, state_dim), dtype=np.float32)
         self.actions = np.zeros((buffer_size, action_dim), dtype=np.float32)
         self.log_probs = np.zeros(buffer_size, dtype=np.float32)
@@ -50,30 +45,36 @@ class PPOBuffer:
         self.pos = 0
         self.gamma = gamma
         self.gae_lambda = gae_lambda
-        self.buffer_size = buffer_size
 
-    def add(self, state: np.ndarray, action: np.ndarray, log_prob: float, reward: float, value: float, done: bool):
+    def add(self, state, action, log_prob, reward, value, done):
         self.states[self.pos] = state
         self.actions[self.pos] = action
         self.log_probs[self.pos] = log_prob
         self.rewards[self.pos] = reward
         self.values[self.pos] = value
         self.dones[self.pos] = done
-        self.pos += 1
+        self.pos = (self.pos + 1) % self.buffer_size 
 
-    def compute_advantages(self):
-        """计算GAE优势"""
-        last_value = self.values[-1] if not self.dones[-1] else 0
+    def is_full(self):
+        return self.pos == self.buffer_size - 1
+    
+    def compute_advantages(self, last_value, last_done):
         last_gae = 0
         for t in reversed(range(self.buffer_size)):
-            delta = self.rewards[t] + self.gamma * last_value * (1 - self.dones[t]) - self.values[t]
-            last_gae = delta + self.gamma * self.gae_lambda * (1 - self.dones[t]) * last_gae
+            if t == self.buffer_size - 1:
+                next_non_terminal = 1.0 - last_done
+                next_value = last_value
+            else:
+                next_non_terminal = 1.0 - self.dones[t+1]
+                next_value = self.values[t+1]
+            
+            delta = self.rewards[t] + self.gamma * next_value * next_non_terminal - self.values[t]
+            last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
             self.advantages[t] = last_gae
-            last_value = self.values[t]
+        
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
-    def get_batches(self, batch_size: int):
-        """生成随机批次"""
+    def get_batches(self, batch_size):
         indices = np.random.permutation(self.buffer_size)
         for start in range(0, self.buffer_size, batch_size):
             end = start + batch_size
@@ -87,13 +88,9 @@ class PPOBuffer:
             )
 
 class PPOAgent:
-    def __init__(self, env, lr: float = 3e-4, gamma: float = 0.99, 
-                 clip_eps: float = 0.2, ent_coef: float = 0.01, 
-                 n_epochs: int = 10, batch_size: int = 64, 
-                 buffer_size: int = 2048):
-        self.env = env
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.shape[0]
+    def __init__(self, state_dim, action_dim, lr=3e-4, gamma=0.99, 
+                 clip_eps=0.2, ent_coef=0.01, n_epochs=4, batch_size=64, 
+                 buffer_size=2048):
         self.actor_critic = ActorCritic(state_dim, action_dim)
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=lr)
         self.buffer = PPOBuffer(buffer_size, state_dim, action_dim, gamma)
@@ -101,23 +98,42 @@ class PPOAgent:
         self.ent_coef = ent_coef
         self.n_epochs = n_epochs
         self.batch_size = batch_size
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=1000,
+            eta_min=1e-5
+        )
+
+    def act(self, state):
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state)
+            mean, logstd, value = self.actor_critic(state_tensor)
+            dist = Normal(mean, logstd.exp())
+            action = dist.sample()
+            action = torch.clamp(action, 0, 1)
+            log_prob = dist.log_prob(action).sum(-1)
+        return action.numpy(), log_prob.item(), value.item()
 
     def update(self):
-        """PPO更新逻辑"""
-        self.buffer.compute_advantages()
         
+        # 计算优势
+        last_state = self.buffer.states[-1]
+        with torch.no_grad():
+            last_value = self.actor_critic(torch.FloatTensor(last_state))[2]
+        last_done = self.buffer.dones[-1] if self.buffer.pos > 0 else True
+        self.buffer.compute_advantages(last_value, last_done)
+        
+        # 多epoch更新
         for _ in range(self.n_epochs):
             for batch in self.buffer.get_batches(self.batch_size):
                 states, actions, old_log_probs, advantages, old_values = batch
                 
-                # 计算新策略的概率和值
-                mean, logstd, values = self.actor_critic(states)
-                dist = Normal(mean, logstd.exp())
-                new_log_probs = dist.log_prob(actions).sum(-1)
-                entropy = dist.entropy().mean()
+                means, logstds, values = self.actor_critic(states)
+                dist = Normal(means, logstds.exp())
+                log_probs = dist.log_prob(actions).sum(-1)
                 
-                # 策略损失（Clipped Surrogate Objective）
-                ratios = (new_log_probs - old_log_probs).exp()
+                # 策略损失
+                ratios = torch.exp(log_probs - old_log_probs)
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1-self.clip_eps, 1+self.clip_eps) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -125,40 +141,53 @@ class PPOAgent:
                 # 值函数损失
                 value_loss = F.mse_loss(values.flatten(), old_values + advantages)
                 
-                # 总损失
-                loss = policy_loss + 0.5 * value_loss - self.ent_coef * entropy
+                # 熵正则化
+                entropy_loss = -dist.entropy().mean()
+
+                loss = policy_loss + 0.5 * value_loss + self.ent_coef * entropy_loss
                 
-                # 梯度更新
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+                self.scheduler.step()
         
-        self.buffer.pos = 0  # 清空缓冲区
+        self.buffer.pos = 0
+        
 
-def train_ppo(env, max_episodes: int = 1000):
-    agent = PPOAgent(env)
+def train_ppo():
+    env = FDTDEnv()
+    agent = PPOAgent(
+        state_dim=env.observation_space.shape[0],
+        action_dim=env.action_space.shape[0],
+        buffer_size=16,
+        batch_size=4,
+        n_epochs=4,
+        ent_coef=0.01
+    )
     
-    for episode in range(max_episodes):
-        state, _ = env.reset()
-        episode_reward = 0
+    for episode in range(10000):
+        state = env.reset()
+        episode_rewards = []
         
         while True:
-            action, log_prob, value = agent.actor_critic.act(state)
+            action, log_prob, value = agent.act(state)
             next_state, reward, done, info = env.step(action)
+
+            print(f'[{time.time()-env._start_time:.2f}]', next_state, reward, done, info)
             
             agent.buffer.add(state, action, log_prob, reward, value, done)
-            episode_reward += reward
+            episode_rewards.append(reward)
             state = next_state
             
-            if agent.buffer.pos == agent.buffer.buffer_size:
+            if agent.buffer.is_full():
                 agent.update()
             
-            if done:
+            if done:    
                 break
         
-        print(f"Episode {episode}, Reward: {episode_reward:.2f}")
+        print(f"Episode {episode}, Average Reward: {np.mean(episode_rewards):.2f}, max: {np.max(episode_rewards):.2f}")
+        
+        # 只关心训练过程中找到的参数组合，模型直接丢弃
 
-# 使用示例
 if __name__ == "__main__":
-    env = FDTDEnv()  # 你的环境实例
-    train_ppo(env)
+    train_ppo()
