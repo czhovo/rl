@@ -24,6 +24,21 @@ class ActorCritic(nn.Module):
         self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
         # 价值头
         self.critic = nn.Linear(hidden_dim, 1)
+        # 初始化所有层参数
+        self.init_weights()
+
+    def init_weights(self):
+        for layer in self.shared:
+            nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+            nn.init.constant_(layer.bias, 0.0)
+
+        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        nn.init.constant_(self.actor_mean.bias, 0.0)
+
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.constant_(self.critic.bias, 0.0)
+
+        nn.init.normal_(self.actor_logstd, mean=-0.5, std=0.1)
 
     def forward(self, x):
         hidden = self.shared(x)
