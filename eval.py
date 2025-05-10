@@ -102,7 +102,7 @@ class Evaluator:
             self.fdtd_output_path.unlink()
         
         # 启动仿真进程
-        cmd = f'"{self.fdtd_path}" "{self.full_fsp_path}" -nw -run "{self.full_script_path}"'
+        cmd = f'"{self.fdtd_path}" {self.full_fsp_path} -nw -run {self.full_script_path}'
         os.system(cmd)
 
         # 等待结果
