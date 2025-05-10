@@ -32,11 +32,13 @@ class FDTDEnv:
         
         # 时间
         self._start_time = time.time()
+        print('Env init time:', self._start_time)
+
         # 路径配置
         self.fdtd_path = fdtd_path
         self.fast_fsp_path = work_dir / fast_fsp_name
         self.fast_script_path = work_dir / fast_script_name
-        self.cache_dir = cache_dir
+        self.cache_dir = work_dir / cache_dir
         self.cache_file = self.cache_dir / "reward_cache.npz"
         
         # 文件
@@ -217,6 +219,7 @@ class FDTDEnv:
                 start_time = time.time()
                 while not self.fdtd_output_path.exists():
                     if time.time() - start_time > 480:  # 6分钟超时
+                        print(f'[{time.time()-self._start_time:.2f}]', 'simulation timeout')
                         raise TimeoutError("FDTD simulation timeout")
                     if proc.poll() is not None and proc.returncode != 0:  # 进程异常退出
                         raise ValueError(f"FDTD crashed with code {proc.returncode}")

@@ -28,7 +28,7 @@ class ActorCritic(nn.Module):
     def forward(self, x):
         hidden = self.shared(x)
         mean = torch.sigmoid(self.actor_mean(hidden))
-        logstd = self.actor_logstd.expand_as(mean)
+        logstd = self.actor_logstd.squeeze(0).expand_as(mean)
         value = self.critic(hidden)
         return mean, logstd, value
     
@@ -115,7 +115,7 @@ class PPOAgent:
         return action.numpy(), log_prob.item(), value.item()
 
     def update(self):
-        
+        print('update agent')
         # 计算优势
         last_state = self.buffer.states[-1]
         with torch.no_grad():
