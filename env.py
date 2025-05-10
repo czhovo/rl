@@ -184,7 +184,7 @@ class FDTDEnv:
         )
     
     def _run_fast_simulation(self, pra: np.ndarray, max_retries: int = 2) -> Tuple[np.ndarray, bool]:
-        """执行仿真并处理异常（自动重试机制）
+        """执行快速仿真并处理异常
         
         Args:
             pra: 参数数组
