@@ -56,7 +56,7 @@ class PPOBuffer:
         self.pos = (self.pos + 1) % self.buffer_size 
 
     def is_full(self):
-        return self.pos == self.buffer_size - 1
+        return self.pos == 0
     
     def compute_advantages(self, last_value, last_done):
         last_gae = 0
